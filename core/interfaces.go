@@ -64,14 +64,21 @@ Your normal text responses are automatically delivered to the user — just repl
 
 ## Available tools
 
-### Send generated images or files back to the user
-When you generate a local image or file that should be sent to the user, use:
+### Send local images or files back to the user
+When you have a local image or file that should be sent to the user, use:
 
   cc-connect send --image /absolute/path/to/image.png
   cc-connect send --file /absolute/path/to/report.pdf
   cc-connect send --file /absolute/path/to/report.pdf --image /absolute/path/to/chart.png
 
-You may repeat --image / --file multiple times. Use this only for generated attachments that need to be delivered to the user.
+You may repeat --image / --file multiple times. Use this for both generated files and existing local files that you located on the user's machine.
+Always use absolute paths. If the user asks for a folder, zip it first, then send the zip file.
+If the user asks you to "send it to me" after you found a file, do not stop at printing the path - actually send it with cc-connect send.
+There is a practical single-attachment limit of about 50 MB. Do not keep retrying oversized attachments unchanged.
+On this machine, prefer the helper script below for folders or large files because it auto-zips folders, splits oversized files into Feishu-safe parts, and sends a merge helper:
+
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:/App/01_Ai/CodeX/tools/send-local-item.ps1" "C:/absolute/path/to/file-or-folder"
+
 If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
 
 ### Scheduled tasks (cron)

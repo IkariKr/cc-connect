@@ -38,6 +38,7 @@ const (
 	slowAgentSend       = 2 * time.Second  // agentSession.Send
 	slowAgentFirstEvent = 15 * time.Second // time from send to first agent event
 	slowAgentAckDelay   = 4 * time.Second  // send a visible ack if the turn stays silent for too long
+	localSendTimeout    = 30 * time.Minute
 )
 
 // VersionInfo is set by main at startup so that /version works.
@@ -1304,6 +1305,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
+	if e.tryHandleDirectLocalSend(p, msg) {
+		return
+	}
+
 	// Multi-workspace resolution
 	var wsAgent Agent
 	var wsSessions *SessionManager
@@ -1423,6 +1428,167 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	)
 
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+}
+
+func (e *Engine) tryHandleDirectLocalSend(p Platform, msg *Message) bool {
+	if strings.HasPrefix(msg.Content, "/") || len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Audio != nil {
+		return false
+	}
+	if !e.isAdmin(msg.UserID) {
+		return false
+	}
+
+	targetPath := detectDirectLocalSendTarget(msg.Content)
+	if targetPath == "" {
+		return false
+	}
+
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+	e.sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	session.AddHistory("user", msg.Content)
+	e.sessions.Save()
+
+	e.send(p, msg.ReplyCtx, directLocalSendNoticeText(string(e.i18n.CurrentLang()), filepath.Base(targetPath)))
+
+	go e.runDirectLocalSend(p, msg, session, targetPath)
+	return true
+}
+
+func detectDirectLocalSendTarget(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !containsDirectSendIntent(trimmed) {
+		return ""
+	}
+
+	start := -1
+	for i := 0; i+2 < len(trimmed); i++ {
+		c := trimmed[i]
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) && trimmed[i+1] == ':' && (trimmed[i+2] == '\\' || trimmed[i+2] == '/') {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+
+	candidate := strings.TrimSpace(trimmed[start:])
+	candidate = strings.Trim(candidate, "\"'“”")
+	if pathExists(candidate) {
+		return filepath.Clean(candidate)
+	}
+
+	runes := []rune(candidate)
+	for i := len(runes); i > 0; i-- {
+		prefix := strings.TrimSpace(string(runes[:i]))
+		prefix = strings.TrimRight(prefix, " \t\r\n,，。.!！？；;：:)]}》」』\"'")
+		if pathExists(prefix) {
+			return filepath.Clean(prefix)
+		}
+	}
+
+	return ""
+}
+
+func containsDirectSendIntent(content string) bool {
+	intents := []string{
+		"发给我",
+		"发送给我",
+		"发我",
+		"传给我",
+		"传我",
+		"发到飞书",
+		"发回飞书",
+		"send me",
+		"send it to me",
+	}
+	lower := strings.ToLower(content)
+	for _, phrase := range intents {
+		if strings.Contains(lower, strings.ToLower(phrase)) || strings.Contains(content, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Clean(path))
+	return err == nil
+}
+
+func directLocalSendNoticeText(lang string, baseName string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(lang)), "zh") {
+		if strings.TrimSpace(baseName) == "" {
+			return "已收到，正在直接打包并发送..."
+		}
+		return fmt.Sprintf("已收到，正在直接打包并发送：%s", baseName)
+	}
+	if strings.TrimSpace(baseName) == "" {
+		return "Received. Packaging and sending directly..."
+	}
+	return fmt.Sprintf("Received. Packaging and sending directly: %s", baseName)
+}
+
+func (e *Engine) runDirectLocalSend(p Platform, msg *Message, session *Session, targetPath string) {
+	workDir := "."
+	if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+		if v := strings.TrimSpace(wd.GetWorkDir()); v != "" {
+			workDir = v
+		}
+	}
+	helperPath := filepath.Join(workDir, "tools", "send-local-item.ps1")
+	if _, err := os.Stat(helperPath); err != nil {
+		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), fmt.Sprintf("send helper not found: %s", helperPath)))
+		session.AddHistory("assistant", "本地直连发送失败：找不到发送脚本。")
+		e.sessions.Save()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(e.ctx, localSendTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath, targetPath)
+	cmd.Dir = workDir
+	envVars := []string{
+		"CC_PROJECT=" + e.name,
+		"CC_SESSION_KEY=" + msg.SessionKey,
+	}
+	if exePath, err := os.Executable(); err == nil {
+		binDir := filepath.Dir(exePath)
+		if curPath := os.Getenv("PATH"); curPath != "" {
+			envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
+		} else {
+			envVars = append(envVars, "PATH="+binDir)
+		}
+	}
+	cmd.Env = MergeEnv(os.Environ(), envVars)
+
+	slog.Info("direct local send started", "session", msg.SessionKey, "target", targetPath)
+	output, err := cmd.CombinedOutput()
+	trimmedOutput := strings.TrimSpace(string(output))
+	if ctx.Err() == context.DeadlineExceeded {
+		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "local file send timed out"))
+		session.AddHistory("assistant", "本地直连发送失败：超时。")
+		e.sessions.Save()
+		return
+	}
+	if err != nil {
+		if trimmedOutput == "" {
+			trimmedOutput = err.Error()
+		}
+		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), trimmedOutput))
+		session.AddHistory("assistant", "本地直连发送失败。")
+		e.sessions.Save()
+		slog.Error("direct local send failed", "session", msg.SessionKey, "target", targetPath, "error", err, "output", trimmedOutput)
+		return
+	}
+
+	session.AddHistory("assistant", fmt.Sprintf("已按本地直连方式处理发送：%s", filepath.Base(targetPath)))
+	e.sessions.Save()
+	slog.Info("direct local send completed", "session", msg.SessionKey, "target", targetPath, "output", trimmedOutput)
 }
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {
