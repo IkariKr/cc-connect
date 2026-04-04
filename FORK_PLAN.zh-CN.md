@@ -35,7 +35,7 @@ These are tightly coupled to your own workflow and should stay in your fork firs
 - helper-driven large-file/folder send flow
 - 25 MB conservative split policy
 - `AGENTS.md` local instructions
-- local `tools/send-local-item.ps1`
+- fork-local `tools/send-local-item.ps1`
 - private `codex_home` profile and local startup scripts
 - any Chinese trigger heuristics aimed at your Feishu usage style
 

@@ -77,7 +77,7 @@ If the user asks you to "send it to me" after you found a file, do not stop at p
 There is a practical single-attachment limit of about 50 MB. Do not keep retrying oversized attachments unchanged.
 On this machine, prefer the helper script below for folders or large files because it auto-zips folders, splits oversized files into Feishu-safe parts, and sends a merge helper:
 
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:/App/01_Ai/CodeX/tools/send-local-item.ps1" "C:/absolute/path/to/file-or-folder"
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "./tools/send-local-item.ps1" "C:/absolute/path/to/file-or-folder"
 
 If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
 
