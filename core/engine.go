@@ -37,6 +37,7 @@ const (
 	slowAgentClose      = 3 * time.Second  // agentSession.Close
 	slowAgentSend       = 2 * time.Second  // agentSession.Send
 	slowAgentFirstEvent = 15 * time.Second // time from send to first agent event
+	slowAgentAckDelay   = 4 * time.Second  // send a visible ack if the turn stays silent for too long
 )
 
 // VersionInfo is set by main at startup so that /version works.
@@ -2165,6 +2166,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
+	slowAckSent := false
 	triggerAutoCompress := false
 	pendingSend := sendDone
 
@@ -2190,6 +2192,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		defer idleTimer.Stop()
 		idleCh = idleTimer.C
 	}
+
+	var ackTimer *time.Timer
+	var ackCh <-chan time.Time
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
@@ -2224,7 +2229,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 				return
 			}
+			if ackTimer == nil {
+				ackTimer = time.NewTimer(slowAgentAckDelay)
+				ackCh = ackTimer.C
+			}
 			continue
+		case <-ackCh:
+			ackCh = nil
+			if ackTimer != nil {
+				ackTimer.Stop()
+			}
+			if !firstEventLogged && !slowAckSent {
+				state.mu.Lock()
+				p := state.platform
+				state.mu.Unlock()
+				e.send(p, replyCtx, processingNoticeText(string(e.i18n.CurrentLang())))
+				slowAckSent = true
+			}
 		case <-idleCh:
 			slog.Error("agent session idle timeout: no events for too long, killing session",
 				"session_key", sessionKey, "timeout", e.eventIdleTimeout, "elapsed", time.Since(turnStart))
@@ -2258,6 +2279,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		if !firstEventLogged {
 			firstEventLogged = true
+			if ackTimer != nil {
+				if !ackTimer.Stop() {
+					select {
+					case <-ackTimer.C:
+					default:
+					}
+				}
+				ackCh = nil
+			}
 			if elapsed := time.Since(waitStart); elapsed >= slowAgentFirstEvent {
 				slog.Warn("slow agent first event", "elapsed", elapsed, "session", sessionKey, "event_type", event.Type)
 			}
@@ -2734,6 +2764,20 @@ channelClosed:
 				}
 			}
 		}
+	}
+}
+
+func processingNoticeText(lang string) string {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	switch {
+	case strings.HasPrefix(l, "zh"):
+		return "已收到，正在处理..."
+	case strings.HasPrefix(l, "ja"):
+		return "已收到，正在处理..."
+	case strings.HasPrefix(l, "es"):
+		return "Message received, processing..."
+	default:
+		return "Message received, processing..."
 	}
 }
 
