@@ -106,19 +106,19 @@ type replyContext struct {
 }
 
 type Platform struct {
-	platformName          string
-	domain                string
-	appID                 string
-	appSecret             string
-	progressStyle         string
-	useInteractiveCard    bool
-	self                  core.Platform
-	reactionEmoji         string
-	allowFrom             string
+	platformName               string
+	domain                     string
+	appID                      string
+	appSecret                  string
+	progressStyle              string
+	useInteractiveCard         bool
+	self                       core.Platform
+	reactionEmoji              string
+	allowFrom                  string
 	groupReplyAll              bool
 	respondToAtEveryoneAndHere bool
-	shareSessionInChannel bool
-	threadIsolation       bool
+	shareSessionInChannel      bool
+	threadIsolation            bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	client           *lark.Client
@@ -220,24 +220,24 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	base := &Platform{
-		platformName:          name,
-		domain:                domain,
-		appID:                 appID,
-		appSecret:             appSecret,
-		progressStyle:         progressStyle,
-		useInteractiveCard:    useInteractiveCard,
-		reactionEmoji:         reactionEmoji,
-		allowFrom:             allowFrom,
+		platformName:               name,
+		domain:                     domain,
+		appID:                      appID,
+		appSecret:                  appSecret,
+		progressStyle:              progressStyle,
+		useInteractiveCard:         useInteractiveCard,
+		reactionEmoji:              reactionEmoji,
+		allowFrom:                  allowFrom,
 		groupReplyAll:              groupReplyAll,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
-		shareSessionInChannel: shareSessionInChannel,
-		threadIsolation:       threadIsolation,
-		noReplyToTrigger:      noReplyToTrigger,
-		client:                lark.NewClient(appID, appSecret, clientOpts...),
-		replayClient:          newFeishuReplayClient(appID, appSecret, domain),
-		port:                  port,
-		callbackPath:          callbackPath,
-		encryptKey:            encryptKey,
+		shareSessionInChannel:      shareSessionInChannel,
+		threadIsolation:            threadIsolation,
+		noReplyToTrigger:           noReplyToTrigger,
+		client:                     lark.NewClient(appID, appSecret, clientOpts...),
+		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
+		port:                       port,
+		callbackPath:               callbackPath,
+		encryptKey:                 encryptKey,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -666,10 +666,12 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		chatType = *msg.ChatType
 	}
 	mentionCount := len(msg.Mentions)
-	slog.Debug(p.tag()+": inbound message",
+	slog.Info(p.tag()+": inbound message",
 		"message_id", messageID,
 		"chat_id", chatID,
+		"user_id", userID,
 		"chat_type", chatType,
+		"msg_type", msgType,
 		"root_id", stringValue(msg.RootId),
 		"thread_id", stringValue(msg.ThreadId),
 		"parent_id", stringValue(msg.ParentId),
@@ -682,16 +684,16 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		if !isBotMentioned(msg.Mentions, p.botOpenID) {
 			// Feishu @all sends {"text":"@_all"} with 0 mentions.
 			if p.respondToAtEveryoneAndHere && msg.Content != nil && strings.Contains(*msg.Content, "@_all") {
-				slog.Debug(p.tag()+": responding to @all message", "chat_id", chatID)
+				slog.Info(p.tag()+": responding to @all message", "chat_id", chatID, "message_id", messageID)
 			} else {
-				slog.Debug(p.tag()+": ignoring group message without bot mention", "chat_id", chatID)
+				slog.Info(p.tag()+": ignoring group message without bot mention", "chat_id", chatID, "message_id", messageID)
 				return nil
 			}
 		}
 	}
 
 	if !core.AllowList(p.allowFrom, userID) {
-		slog.Debug(p.tag()+": message from unauthorized user", "user", userID)
+		slog.Warn(p.tag()+": message from unauthorized user", "user", userID, "chat_id", chatID, "message_id", messageID, "allow_from", p.allowFrom)
 		return nil
 	}
 
@@ -709,7 +711,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 
 	sessionKey := p.makeSessionKey(msg, chatID, userID)
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-	slog.Debug(p.tag()+": routed inbound message",
+	slog.Info(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
 		"reply_in_thread", p.shouldReplyInThread(rctx),
@@ -746,6 +748,16 @@ func (p *Platform) dispatchMessage(msgType, content string, mentions []*larkim.M
 			)
 			return
 		}
+		textPreview := text
+		if len([]rune(textPreview)) > 120 {
+			textPreview = string([]rune(textPreview)[:120]) + "..."
+		}
+		slog.Info(p.tag()+": dispatching text message",
+			"message_id", messageID,
+			"session_key", sessionKey,
+			"user_id", userID,
+			"text_preview", textPreview,
+		)
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
