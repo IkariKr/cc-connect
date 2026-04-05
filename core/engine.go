@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -1305,10 +1306,6 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
-	if e.tryHandleDirectLocalSend(p, msg) {
-		return
-	}
-
 	// Multi-workspace resolution
 	var wsAgent Agent
 	var wsSessions *SessionManager
@@ -1379,6 +1376,34 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
 
+	workDir := resolveProcessingWorkDir(agent, resolvedWorkspace)
+	if len(msg.Images) > 0 {
+		stagedImages, stagedPaths := StageImagesToDisk(workDir, msg.Images)
+		msg.Images = stagedImages
+		if len(stagedPaths) > 0 {
+			sessions.UpdateRecentFiles(msg.SessionKey, stagedPaths)
+			sessions.Save()
+		}
+	}
+	if len(msg.Files) > 0 {
+		stagedFiles, stagedPaths := StageFilesToDisk(workDir, msg.Files)
+		msg.Files = stagedFiles
+		if len(stagedPaths) > 0 {
+			sessions.UpdateRecentFiles(msg.SessionKey, stagedPaths)
+			sessions.Save()
+		}
+	}
+
+	if e.tryHandleDirectLocalSave(p, msg, sessions, workDir) {
+		return
+	}
+	if e.tryHandlePendingDirectLocalSave(p, msg, sessions) {
+		return
+	}
+	if e.tryHandleDirectLocalSend(p, msg, sessions, workDir) {
+		return
+	}
+
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	if !session.TryLock() {
@@ -1430,7 +1455,19 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
 }
 
-func (e *Engine) tryHandleDirectLocalSend(p Platform, msg *Message) bool {
+func resolveProcessingWorkDir(agent Agent, resolvedWorkspace string) string {
+	if v := strings.TrimSpace(resolvedWorkspace); v != "" {
+		return v
+	}
+	if wd, ok := agent.(WorkDirSwitcher); ok {
+		if v := strings.TrimSpace(wd.GetWorkDir()); v != "" {
+			return v
+		}
+	}
+	return "."
+}
+
+func (e *Engine) tryHandleDirectLocalSend(p Platform, msg *Message, sessions *SessionManager, workDir string) bool {
 	if strings.HasPrefix(msg.Content, "/") || len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Audio != nil {
 		return false
 	}
@@ -1443,14 +1480,76 @@ func (e *Engine) tryHandleDirectLocalSend(p Platform, msg *Message) bool {
 		return false
 	}
 
-	session := e.sessions.GetOrCreateActive(msg.SessionKey)
-	e.sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	session.AddHistory("user", msg.Content)
-	e.sessions.Save()
+	sessions.Save()
 
 	e.send(p, msg.ReplyCtx, directLocalSendNoticeText(string(e.i18n.CurrentLang()), filepath.Base(targetPath)))
 
-	go e.runDirectLocalSend(p, msg, session, targetPath)
+	go e.runDirectLocalSend(p, msg, session, sessions, targetPath, workDir)
+	return true
+}
+
+func (e *Engine) tryHandleDirectLocalSave(p Platform, msg *Message, sessions *SessionManager, workDir string) bool {
+	if strings.HasPrefix(msg.Content, "/") || msg.Audio != nil {
+		return false
+	}
+	if !e.isAdmin(msg.UserID) {
+		return false
+	}
+
+	targetPath := detectDirectLocalSaveTarget(msg.Content)
+	if targetPath == "" {
+		return false
+	}
+
+	sourcePaths := inboundLocalPaths(msg)
+	if len(sourcePaths) == 0 && !preferPendingSaveTarget(msg.Content) {
+		sourcePaths = sessions.GetRecentFiles(msg.SessionKey)
+	}
+	if len(sourcePaths) == 0 {
+		sessions.SetPendingSaveTarget(msg.SessionKey, targetPath)
+		sessions.Save()
+		e.send(p, msg.ReplyCtx, directLocalSavePendingText(string(e.i18n.CurrentLang()), targetPath))
+		return true
+	}
+
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	session.AddHistory("user", msg.Content)
+	sessions.Save()
+
+	e.send(p, msg.ReplyCtx, directLocalSaveNoticeText(string(e.i18n.CurrentLang()), filepath.Base(targetPath)))
+	go e.runDirectLocalSave(p, msg, session, sessions, sourcePaths, targetPath)
+	return true
+}
+
+func (e *Engine) tryHandlePendingDirectLocalSave(p Platform, msg *Message, sessions *SessionManager) bool {
+	if !e.isAdmin(msg.UserID) {
+		return false
+	}
+	if strings.HasPrefix(strings.TrimSpace(msg.Content), "/") || msg.Audio != nil {
+		return false
+	}
+
+	targetPath := sessions.GetPendingSaveTarget(msg.SessionKey)
+	if targetPath == "" {
+		return false
+	}
+
+	sourcePaths := inboundLocalPaths(msg)
+	if len(sourcePaths) == 0 {
+		return false
+	}
+
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	session.AddHistory("user", msg.Content)
+	sessions.Save()
+
+	e.send(p, msg.ReplyCtx, directLocalSaveNoticeText(string(e.i18n.CurrentLang()), filepath.Base(targetPath)))
+	go e.runDirectLocalSave(p, msg, session, sessions, sourcePaths, targetPath)
 	return true
 }
 
@@ -1490,6 +1589,86 @@ func detectDirectLocalSendTarget(content string) string {
 	return ""
 }
 
+func detectDirectLocalSaveTarget(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !containsDirectSaveIntent(trimmed) {
+		return ""
+	}
+	return detectDestinationAbsolutePath(trimmed)
+}
+
+func detectExistingAbsolutePath(content string) string {
+	candidate := detectDestinationAbsolutePath(content)
+	if candidate == "" {
+		return ""
+	}
+	if pathExists(candidate) {
+		return filepath.Clean(candidate)
+	}
+	return ""
+}
+
+func detectDestinationAbsolutePath(content string) string {
+	start := absolutePathStart(content)
+	if start < 0 {
+		return ""
+	}
+
+	candidate := strings.TrimSpace(content[start:])
+	candidate = strings.Trim(candidate, "\"'")
+	runes := []rune(candidate)
+	for i := len(runes); i > 0; i-- {
+		prefix := strings.TrimSpace(string(runes[:i]))
+		prefix = strings.Trim(prefix, "\"'")
+		prefix = strings.TrimRight(prefix, " \t\r\n,，。!?？！;；)]}】》\"'")
+		if !looksLikeAbsolutePath(prefix) {
+			continue
+		}
+		clean := filepath.Clean(prefix)
+		if pathExists(clean) || parentPathExists(clean) || absolutePathRootExists(clean) {
+			return clean
+		}
+	}
+
+	return ""
+}
+
+func absolutePathStart(content string) int {
+	for i := 0; i+2 < len(content); i++ {
+		c := content[i]
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) && content[i+1] == ':' && (content[i+2] == '\\' || content[i+2] == '/') {
+			return i
+		}
+	}
+	for i := 0; i < len(content); i++ {
+		if content[i] != '/' {
+			continue
+		}
+		if i == 0 {
+			return i
+		}
+		switch content[i-1] {
+		case ' ', '\t', '\n', '\r', '"', '\'', '(', '[', '{':
+			return i
+		}
+	}
+	return -1
+}
+
+func looksLikeAbsolutePath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if len(path) >= 3 {
+		c := path[0]
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+			return true
+		}
+	}
+	return strings.HasPrefix(path, "/")
+}
+
 func containsDirectSendIntent(content string) bool {
 	intents := []string{
 		"发给我",
@@ -1511,12 +1690,68 @@ func containsDirectSendIntent(content string) bool {
 	return false
 }
 
+func preferPendingSaveTarget(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if lower == "" {
+		return false
+	}
+	backRefs := []string{
+		"刚才", "刚刚", "上一张", "上一个", "上一份", "刚发", "刚传",
+		"that one", "previous", "last one", "last file", "just sent",
+	}
+	for _, phrase := range backRefs {
+		if strings.Contains(lower, strings.ToLower(phrase)) || strings.Contains(content, phrase) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsDirectSaveIntent(content string) bool {
+	intents := []string{
+		"保存到",
+		"保存至",
+		"存到",
+		"存至",
+		"存入",
+		"放到",
+		"放进",
+		"save to",
+		"save it to",
+		"store in",
+		"copy to",
+	}
+	lower := strings.ToLower(content)
+	for _, phrase := range intents {
+		if strings.Contains(lower, strings.ToLower(phrase)) || strings.Contains(content, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 func pathExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
 	_, err := os.Stat(filepath.Clean(path))
 	return err == nil
+}
+
+func parentPathExists(path string) bool {
+	parent := filepath.Dir(filepath.Clean(path))
+	if strings.TrimSpace(parent) == "" || parent == "." {
+		return false
+	}
+	return pathExists(parent)
+}
+
+func absolutePathRootExists(path string) bool {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if len(path) >= 3 && path[1] == ':' {
+		return pathExists(path[:3])
+	}
+	return strings.HasPrefix(path, "/")
 }
 
 func directLocalSendNoticeText(lang string, baseName string) string {
@@ -1532,18 +1767,64 @@ func directLocalSendNoticeText(lang string, baseName string) string {
 	return fmt.Sprintf("Received. Packaging and sending directly: %s", baseName)
 }
 
-func (e *Engine) runDirectLocalSend(p Platform, msg *Message, session *Session, targetPath string) {
-	workDir := "."
-	if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
-		if v := strings.TrimSpace(wd.GetWorkDir()); v != "" {
-			workDir = v
-		}
+func directLocalSaveNoticeText(lang string, baseName string) string {
+	if strings.TrimSpace(baseName) == "" {
+		return "Received. Saving directly to the local folder..."
 	}
+	return fmt.Sprintf("Received. Saving directly to the local folder: %s", baseName)
+}
+
+func directLocalSaveMissingText(lang string) string {
+	return "I could not find a recently received file. Please send the file first, then tell me where to save it."
+}
+
+func directLocalSavePendingText(lang string, targetPath string) string {
+	return fmt.Sprintf("Okay. Send the image or file next, and I will save it to %s.", targetPath)
+}
+
+func directLocalSaveSuccessText(lang string, savedPaths []string, targetPath string) string {
+	names := make([]string, 0, len(savedPaths))
+	for _, path := range savedPaths {
+		names = append(names, filepath.Base(path))
+	}
+	return fmt.Sprintf("Saved to %s: %s", targetPath, strings.Join(names, ", "))
+}
+
+func fileLocalPathsFromAttachments(files []FileAttachment) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		if strings.TrimSpace(file.LocalPath) == "" {
+			continue
+		}
+		paths = append(paths, file.LocalPath)
+	}
+	return paths
+}
+
+func imageLocalPathsFromAttachments(images []ImageAttachment) []string {
+	paths := make([]string, 0, len(images))
+	for _, image := range images {
+		if strings.TrimSpace(image.LocalPath) == "" {
+			continue
+		}
+		paths = append(paths, image.LocalPath)
+	}
+	return paths
+}
+
+func inboundLocalPaths(msg *Message) []string {
+	paths := make([]string, 0, len(msg.Images)+len(msg.Files))
+	paths = append(paths, imageLocalPathsFromAttachments(msg.Images)...)
+	paths = append(paths, fileLocalPathsFromAttachments(msg.Files)...)
+	return paths
+}
+
+func (e *Engine) runDirectLocalSend(p Platform, msg *Message, session *Session, sessions *SessionManager, targetPath string, workDir string) {
 	helperPath := filepath.Join(workDir, "tools", "send-local-item.ps1")
 	if _, err := os.Stat(helperPath); err != nil {
 		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), fmt.Sprintf("send helper not found: %s", helperPath)))
 		session.AddHistory("assistant", "本地直连发送失败：找不到发送脚本。")
-		e.sessions.Save()
+		sessions.Save()
 		return
 	}
 
@@ -1572,7 +1853,7 @@ func (e *Engine) runDirectLocalSend(p Platform, msg *Message, session *Session, 
 	if ctx.Err() == context.DeadlineExceeded {
 		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "local file send timed out"))
 		session.AddHistory("assistant", "本地直连发送失败：超时。")
-		e.sessions.Save()
+		sessions.Save()
 		return
 	}
 	if err != nil {
@@ -1581,14 +1862,120 @@ func (e *Engine) runDirectLocalSend(p Platform, msg *Message, session *Session, 
 		}
 		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), trimmedOutput))
 		session.AddHistory("assistant", "本地直连发送失败。")
-		e.sessions.Save()
+		sessions.Save()
 		slog.Error("direct local send failed", "session", msg.SessionKey, "target", targetPath, "error", err, "output", trimmedOutput)
 		return
 	}
 
 	session.AddHistory("assistant", fmt.Sprintf("已按本地直连方式处理发送：%s", filepath.Base(targetPath)))
-	e.sessions.Save()
+	sessions.Save()
 	slog.Info("direct local send completed", "session", msg.SessionKey, "target", targetPath, "output", trimmedOutput)
+}
+
+func (e *Engine) runDirectLocalSave(p Platform, msg *Message, session *Session, sessions *SessionManager, sourcePaths []string, targetPath string) {
+	savedPaths, err := copyInboundFilesToTarget(sourcePaths, targetPath)
+	if err != nil {
+		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err.Error()))
+		session.AddHistory("assistant", "direct local save failed")
+		sessions.Save()
+		slog.Error("direct local save failed", "session", msg.SessionKey, "target", targetPath, "error", err)
+		return
+	}
+
+	sessions.ClearPendingSaveTarget(msg.SessionKey)
+	e.send(p, msg.ReplyCtx, directLocalSaveSuccessText(string(e.i18n.CurrentLang()), savedPaths, targetPath))
+	session.AddHistory("assistant", fmt.Sprintf("saved inbound files locally: %s", targetPath))
+	sessions.Save()
+	slog.Info("direct local save completed", "session", msg.SessionKey, "target", targetPath, "count", len(savedPaths))
+}
+
+func copyInboundFilesToTarget(sourcePaths []string, targetPath string) ([]string, error) {
+	if len(sourcePaths) == 0 {
+		return nil, fmt.Errorf("no inbound files available")
+	}
+
+	targetPath = filepath.Clean(strings.TrimSpace(targetPath))
+	if targetPath == "" {
+		return nil, fmt.Errorf("target path is empty")
+	}
+
+	destIsFile := len(sourcePaths) == 1 && looksLikeExplicitFileTarget(targetPath)
+	if info, err := os.Stat(targetPath); err == nil && info.IsDir() {
+		destIsFile = false
+	}
+	if !destIsFile {
+		if err := os.MkdirAll(targetPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create target directory: %w", err)
+		}
+	} else {
+		parent := filepath.Dir(targetPath)
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return nil, fmt.Errorf("create parent directory: %w", err)
+		}
+	}
+
+	saved := make([]string, 0, len(sourcePaths))
+	for idx, sourcePath := range sourcePaths {
+		sourcePath = filepath.Clean(strings.TrimSpace(sourcePath))
+		if sourcePath == "" {
+			continue
+		}
+
+		destPath := targetPath
+		if !destIsFile {
+			destPath = nextAvailablePath(filepath.Join(targetPath, filepath.Base(sourcePath)))
+		} else if idx > 0 {
+			return nil, fmt.Errorf("multiple source files cannot be saved to a single file path")
+		}
+
+		if err := copyLocalFile(sourcePath, destPath); err != nil {
+			return nil, err
+		}
+		saved = append(saved, destPath)
+	}
+
+	if len(saved) == 0 {
+		return nil, fmt.Errorf("no inbound files were copied")
+	}
+	return saved, nil
+}
+
+func copyLocalFile(sourcePath, destPath string) error {
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("open source file: %w", err)
+	}
+	defer src.Close()
+
+	info, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("directories are not supported here: %s", sourcePath)
+	}
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("create target file: %w", err)
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("copy file: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close target file: %w", err)
+	}
+	return nil
+}
+
+func looksLikeExplicitFileTarget(path string) bool {
+	if pathExists(path) {
+		info, err := os.Stat(path)
+		return err == nil && !info.IsDir()
+	}
+	return filepath.Ext(path) != ""
 }
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {

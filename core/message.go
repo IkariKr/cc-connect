@@ -66,45 +66,119 @@ func AllowList(allowFrom, userID string) bool {
 
 // ImageAttachment represents an image sent by the user.
 type ImageAttachment struct {
-	MimeType string // e.g. "image/png", "image/jpeg"
-	Data     []byte // raw image bytes
-	FileName string // original filename (optional)
+	MimeType  string // e.g. "image/png", "image/jpeg"
+	Data      []byte // raw image bytes
+	FileName  string // original filename (optional)
+	LocalPath string // staged local path (optional)
 }
 
 // FileAttachment represents a file (PDF, doc, spreadsheet, etc.) sent by the user.
 type FileAttachment struct {
-	MimeType string // e.g. "application/pdf", "text/plain"
-	Data     []byte // raw file bytes
-	FileName string // original filename
+	MimeType  string // e.g. "application/pdf", "text/plain"
+	Data      []byte // raw file bytes
+	FileName  string // original filename
+	LocalPath string // staged local path (optional)
 }
 
-// SaveFilesToDisk saves file attachments to workDir/.cc-connect/attachments/
-// and returns the list of absolute file paths. Agents can reference these paths
-// in their prompts so the CLI can read them with built-in tools.
-func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
+// StageFilesToDisk saves file attachments to workDir/.cc-connect/attachments/
+// and returns a copy of the attachments with LocalPath populated, plus the
+// list of absolute file paths. If a file already has a valid LocalPath, it is
+// reused instead of being written again.
+func StageFilesToDisk(workDir string, files []FileAttachment) ([]FileAttachment, []string) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
 	if err := os.MkdirAll(attachDir, 0o755); err != nil {
 		slog.Warn("SaveFilesToDisk: mkdir failed", "dir", attachDir, "error", err)
 	}
 
+	staged := make([]FileAttachment, 0, len(files))
 	var paths []string
 	for i, f := range files {
+		if f.LocalPath != "" {
+			if _, err := os.Stat(f.LocalPath); err == nil {
+				paths = append(paths, f.LocalPath)
+				staged = append(staged, f)
+				continue
+			}
+			f.LocalPath = ""
+		}
+
 		fname := f.FileName
 		if fname == "" {
 			fname = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
+		} else {
+			fname = filepath.Base(fname)
 		}
-		fpath := filepath.Join(attachDir, fname)
+		fpath := nextAvailablePath(filepath.Join(attachDir, fname))
 		if err := os.WriteFile(fpath, f.Data, 0o644); err != nil {
 			slog.Error("SaveFilesToDisk: write failed", "error", err)
 			continue
 		}
+		f.LocalPath = fpath
+		if f.FileName == "" {
+			f.FileName = filepath.Base(fpath)
+		}
 		paths = append(paths, fpath)
+		staged = append(staged, f)
 		slog.Debug("SaveFilesToDisk: file saved", "path", fpath, "name", f.FileName, "mime", f.MimeType, "size", len(f.Data))
 	}
+	return staged, paths
+}
+
+// SaveFilesToDisk saves file attachments to workDir/.cc-connect/attachments/
+// and returns the list of absolute file paths. Agents can reference these paths
+// in their prompts so the CLI can read them with built-in tools.
+func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
+	_, paths := StageFilesToDisk(workDir, files)
 	return paths
+}
+
+// StageImagesToDisk saves image attachments to workDir/.cc-connect/attachments/
+// and returns a copy of the attachments with LocalPath populated, plus the
+// list of absolute file paths.
+func StageImagesToDisk(workDir string, images []ImageAttachment) ([]ImageAttachment, []string) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+	if err := os.MkdirAll(attachDir, 0o755); err != nil {
+		slog.Warn("StageImagesToDisk: mkdir failed", "dir", attachDir, "error", err)
+	}
+
+	staged := make([]ImageAttachment, 0, len(images))
+	var paths []string
+	for i, img := range images {
+		if img.LocalPath != "" {
+			if _, err := os.Stat(img.LocalPath); err == nil {
+				paths = append(paths, img.LocalPath)
+				staged = append(staged, img)
+				continue
+			}
+			img.LocalPath = ""
+		}
+
+		fname := img.FileName
+		if fname == "" {
+			fname = fmt.Sprintf("image_%d_%d%s", time.Now().UnixMilli(), i, imageExtForMime(img.MimeType))
+		} else {
+			fname = filepath.Base(fname)
+		}
+		fpath := nextAvailablePath(filepath.Join(attachDir, fname))
+		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
+			slog.Error("StageImagesToDisk: write failed", "error", err)
+			continue
+		}
+		img.LocalPath = fpath
+		if img.FileName == "" {
+			img.FileName = filepath.Base(fpath)
+		}
+		paths = append(paths, fpath)
+		staged = append(staged, img)
+		slog.Debug("StageImagesToDisk: image saved", "path", fpath, "name", img.FileName, "mime", img.MimeType, "size", len(img.Data))
+	}
+	return staged, paths
 }
 
 // AppendFileRefs appends file path references to a prompt string.
@@ -118,6 +192,38 @@ func AppendFileRefs(prompt string, filePaths []string) string {
 	return prompt + "\n\n(Files saved locally, please read them: " + strings.Join(filePaths, ", ") + ")"
 }
 
+func nextAvailablePath(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s-%d%s", base, i, ext)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+}
+
+func imageExtForMime(mime string) string {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".bin"
+	}
+}
+
 // AudioAttachment represents a voice/audio message sent by the user.
 type AudioAttachment struct {
 	MimeType string // e.g. "audio/amr", "audio/ogg", "audio/mp4"
@@ -128,20 +234,20 @@ type AudioAttachment struct {
 
 // Message represents a unified incoming message from any platform.
 type Message struct {
-	SessionKey string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
-	Platform   string
-	MessageID  string // platform message ID for tracing
-	UserID     string
-	UserName   string
-	ChatName   string // human-readable chat/group name (optional)
-	Content    string
-	Images     []ImageAttachment // attached images (if any)
-	Files      []FileAttachment  // attached files (if any)
-	Audio        *AudioAttachment // voice message (if any)
-	ChannelKey   string          // platform-provided channel identifier for workspace binding (optional)
-	ReplyCtx     any             // platform-specific context needed for replying
-	FromVoice    bool            // true if message originated from voice transcription
-	ModeOverride string          // if set, temporarily override agent permission mode for this message
+	SessionKey   string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
+	Platform     string
+	MessageID    string // platform message ID for tracing
+	UserID       string
+	UserName     string
+	ChatName     string // human-readable chat/group name (optional)
+	Content      string
+	Images       []ImageAttachment // attached images (if any)
+	Files        []FileAttachment  // attached files (if any)
+	Audio        *AudioAttachment  // voice message (if any)
+	ChannelKey   string            // platform-provided channel identifier for workspace binding (optional)
+	ReplyCtx     any               // platform-specific context needed for replying
+	FromVoice    bool              // true if message originated from voice transcription
+	ModeOverride string            // if set, temporarily override agent permission mode for this message
 }
 
 // EventType distinguishes different kinds of agent output.

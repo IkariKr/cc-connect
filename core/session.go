@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -156,8 +157,10 @@ func (s *Session) GetHistory(n int) []HistoryEntry {
 
 // UserMeta stores human-readable display info for a session key.
 type UserMeta struct {
-	UserName string `json:"user_name,omitempty"`
-	ChatName string `json:"chat_name,omitempty"`
+	UserName          string   `json:"user_name,omitempty"`
+	ChatName          string   `json:"chat_name,omitempty"`
+	RecentFiles       []string `json:"recent_files,omitempty"`
+	PendingSaveTarget string   `json:"pending_save_target,omitempty"`
 }
 
 // sessionSnapshot is the JSON-serializable state of the SessionManager.
@@ -350,6 +353,80 @@ func (sm *SessionManager) GetUserMeta(sessionKey string) *UserMeta {
 	}
 	cp := *m
 	return &cp
+}
+
+// UpdateRecentFiles replaces the remembered inbound file list for a session key.
+func (sm *SessionManager) UpdateRecentFiles(sessionKey string, paths []string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	meta, ok := sm.userMeta[sessionKey]
+	if !ok {
+		meta = &UserMeta{}
+		sm.userMeta[sessionKey] = meta
+	}
+
+	filtered := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		filtered = append(filtered, path)
+	}
+	meta.RecentFiles = filtered
+}
+
+// GetRecentFiles returns the remembered inbound file list for a session key.
+func (sm *SessionManager) GetRecentFiles(sessionKey string) []string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	meta := sm.userMeta[sessionKey]
+	if meta == nil || len(meta.RecentFiles) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(meta.RecentFiles))
+	for _, path := range meta.RecentFiles {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+func (sm *SessionManager) SetPendingSaveTarget(sessionKey, target string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	meta, ok := sm.userMeta[sessionKey]
+	if !ok {
+		meta = &UserMeta{}
+		sm.userMeta[sessionKey] = meta
+	}
+	meta.PendingSaveTarget = strings.TrimSpace(target)
+}
+
+func (sm *SessionManager) GetPendingSaveTarget(sessionKey string) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	meta := sm.userMeta[sessionKey]
+	if meta == nil {
+		return ""
+	}
+	return strings.TrimSpace(meta.PendingSaveTarget)
+}
+
+func (sm *SessionManager) ClearPendingSaveTarget(sessionKey string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	meta := sm.userMeta[sessionKey]
+	if meta == nil {
+		return
+	}
+	meta.PendingSaveTarget = ""
 }
 
 // AllSessions returns all sessions across all user keys.

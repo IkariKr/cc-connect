@@ -432,6 +432,43 @@ func TestSessionManager_UserMetaPersistence(t *testing.T) {
 	}
 }
 
+func TestSessionManager_RecentFilesPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+
+	sm1 := NewSessionManager(path)
+	sm1.NewSession("feishu:oc_abc:ou_xyz", "test")
+	sm1.UpdateRecentFiles("feishu:oc_abc:ou_xyz", []string{
+		filepath.Join(dir, "one.txt"),
+		filepath.Join(dir, "two.txt"),
+	})
+	sm1.Save()
+
+	sm2 := NewSessionManager(path)
+	got := sm2.GetRecentFiles("feishu:oc_abc:ou_xyz")
+	if len(got) != 2 {
+		t.Fatalf("recent files len = %d, want 2", len(got))
+	}
+	if got[0] != filepath.Join(dir, "one.txt") || got[1] != filepath.Join(dir, "two.txt") {
+		t.Fatalf("unexpected recent files: %+v", got)
+	}
+}
+
+func TestSessionManager_PendingSaveTarget(t *testing.T) {
+	sm := NewSessionManager("")
+	sessionKey := "feishu:oc_abc:ou_xyz"
+
+	sm.SetPendingSaveTarget(sessionKey, `D:\Downloads`)
+	if got := sm.GetPendingSaveTarget(sessionKey); got != `D:\Downloads` {
+		t.Fatalf("pending save target = %q, want %q", got, `D:\Downloads`)
+	}
+
+	sm.ClearPendingSaveTarget(sessionKey)
+	if got := sm.GetPendingSaveTarget(sessionKey); got != "" {
+		t.Fatalf("pending save target after clear = %q, want empty", got)
+	}
+}
+
 func TestSessionManager_DeleteByAgentSessionID(t *testing.T) {
 	sm := NewSessionManager("")
 

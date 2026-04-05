@@ -8148,3 +8148,134 @@ func TestExtractSessionKeyParts(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleMessage_DirectLocalSaveWithCurrentFiles(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	workDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: workDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.adminFrom = "*"
+
+	destDir := filepath.Join(t.TempDir(), "saved")
+	msg := &Message{
+		SessionKey: "test:user1",
+		UserID:     "user1",
+		Content:    "save to " + destDir,
+		Files: []FileAttachment{{
+			FileName: "note.txt",
+			Data:     []byte("hello from phone"),
+		}},
+		ReplyCtx: "ctx",
+	}
+
+	e.handleMessage(p, msg)
+
+	savedPath := filepath.Join(destDir, "note.txt")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if data, err := os.ReadFile(savedPath); err == nil {
+			if string(data) != "hello from phone" {
+				t.Fatalf("saved file content = %q, want %q", string(data), "hello from phone")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for saved file %s", savedPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	recent := e.sessions.GetRecentFiles(msg.SessionKey)
+	if len(recent) != 1 {
+		t.Fatalf("recent files len = %d, want 1", len(recent))
+	}
+}
+
+func TestHandleMessage_DirectLocalSaveUsesRecentFiles(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	workDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: workDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.adminFrom = "*"
+
+	sessionKey := "test:user1"
+	sourcePath := filepath.Join(t.TempDir(), "photo.txt")
+	if err := os.WriteFile(sourcePath, []byte("stage first"), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	e.sessions.UpdateRecentFiles(sessionKey, []string{sourcePath})
+
+	destDir := filepath.Join(t.TempDir(), "saved")
+	e.handleMessage(p, &Message{
+		SessionKey: sessionKey,
+		UserID:     "user1",
+		Content:    "the last file, save to " + destDir,
+		ReplyCtx:   "ctx-save",
+	})
+
+	savedPath := filepath.Join(destDir, "photo.txt")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if data, err := os.ReadFile(savedPath); err == nil {
+			if string(data) != "stage first" {
+				t.Fatalf("saved file content = %q, want %q", string(data), "stage first")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for saved file %s", savedPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestHandleMessage_DirectLocalSavePendingTargetThenImage(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	workDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: workDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.adminFrom = "*"
+
+	sessionKey := "test:user1"
+	destDir := filepath.Join(t.TempDir(), "downloads")
+
+	e.handleMessage(p, &Message{
+		SessionKey: sessionKey,
+		UserID:     "user1",
+		Content:    "save to " + destDir,
+		ReplyCtx:   "ctx-1",
+	})
+	if got := e.sessions.GetPendingSaveTarget(sessionKey); got != destDir {
+		t.Fatalf("pending save target = %q, want %q", got, destDir)
+	}
+
+	e.handleMessage(p, &Message{
+		SessionKey: sessionKey,
+		UserID:     "user1",
+		Images: []ImageAttachment{{
+			MimeType: "image/png",
+			Data:     []byte("image-bytes"),
+			FileName: "photo.png",
+		}},
+		ReplyCtx: "ctx-2",
+	})
+
+	savedPath := filepath.Join(destDir, "photo.png")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if data, err := os.ReadFile(savedPath); err == nil {
+			if string(data) != "image-bytes" {
+				t.Fatalf("saved image content = %q, want %q", string(data), "image-bytes")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for saved image %s", savedPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := e.sessions.GetPendingSaveTarget(sessionKey); got != "" {
+		t.Fatalf("pending save target after save = %q, want empty", got)
+	}
+}
