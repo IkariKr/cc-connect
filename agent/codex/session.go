@@ -90,7 +90,11 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment, files
 
 	slog.Debug("codexSession: launching", "resume", isResume, "args", core.RedactArgs(args))
 
-	cmd := exec.CommandContext(cs.ctx, "codex", args...)
+	codexCmd, err := getCodexCommandPath()
+	if err != nil {
+		return fmt.Errorf("codexSession: resolve codex executable: %w", err)
+	}
+	cmd := exec.CommandContext(cs.ctx, codexCmd, args...)
 	cmd.Dir = cs.workDir
 	prepareCmdForKill(cmd)
 	if len(cs.extraEnv) > 0 {

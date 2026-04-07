@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -59,7 +58,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		appServerURL = "ws://127.0.0.1:3845"
 	}
 
-	if _, err := exec.LookPath("codex"); err != nil {
+	if _, err := getCodexCommandPath(); err != nil {
 		return nil, fmt.Errorf("codex: 'codex' CLI not found in PATH, install with: npm install -g @openai/codex")
 	}
 

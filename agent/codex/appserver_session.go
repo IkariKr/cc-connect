@@ -153,7 +153,11 @@ func (s *appServerSession) connect() error {
 	if strings.TrimSpace(s.url) != "" {
 		args = append(args, "--listen", strings.TrimSpace(s.url))
 	}
-	cmd := exec.CommandContext(s.ctx, "codex", args...)
+	codexCmd, err := getCodexCommandPath()
+	if err != nil {
+		return fmt.Errorf("resolve codex executable: %w", err)
+	}
+	cmd := exec.CommandContext(s.ctx, codexCmd, args...)
 	cmd.Dir = s.workDir
 	env := append([]string(nil), s.extraEnv...)
 	if s.codexHome != "" {
@@ -184,7 +188,7 @@ func (s *appServerSession) connect() error {
 	s.stdin = stdin
 	s.procMu.Unlock()
 
-	slog.Info("codex app-server session started", "transport", "stdio", "pid", cmd.Process.Pid, "work_dir", s.workDir)
+	slog.Info("codex app-server session started", "transport", "stdio", "pid", cmd.Process.Pid, "work_dir", s.workDir, "command", codexCmd)
 
 	s.wg.Add(3)
 	go s.readLoop(stdout)
